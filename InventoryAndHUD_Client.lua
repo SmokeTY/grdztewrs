@@ -315,7 +315,7 @@ local function CreateItemRow(itemData, index)
     
     local row = Instance.new("Frame")
     row.Name = "Item_" .. index
-    row.Size = UDim2.new(1, 0, 0, 60)
+    row.Size = UDim2.new(1, -12, 0, 60)
     row.BackgroundColor3 = Color3.fromRGB(35, 35, 55)
     row.BackgroundTransparency = 0.2
     row.BorderSizePixel = 0
@@ -379,6 +379,7 @@ local function CreateItemRow(itemData, index)
     equipBtn.Size = UDim2.new(0, 80, 0, 30)
     equipBtn.Position = UDim2.new(1, -90, 0.5, -15)
     equipBtn.BorderSizePixel = 0
+    equipBtn.AutoButtonColor = true
     
     if itemData.IsEquipped then
         equipBtn.BackgroundColor3 = Color3.fromRGB(40, 150, 40)
@@ -398,10 +399,20 @@ local function CreateItemRow(itemData, index)
     eqCorner.CornerRadius = UDim.new(0, 6)
     eqCorner.Parent = equipBtn
     
-    -- Equip click handler
+    -- Equip click handler - fire to server and request updated inventory
     if not itemData.IsEquipped then
         equipBtn.MouseButton1Click:Connect(function()
+            -- Visual feedback immediately
+            equipBtn.Text = "..."
+            equipBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 50)
+            
+            -- Send equip request to server
             EquipRequestRemote:FireServer(itemData.Id)
+            
+            -- Request fresh inventory after short delay (server needs time to process)
+            task.delay(0.2, function()
+                OpenInventoryRemote:FireServer()
+            end)
         end)
     end
     
@@ -504,8 +515,14 @@ local function UpdateHUD(data)
         -- Update stats
         StatsLabel.Text = "ATK: " .. tostring(data.Attack or 0) .. " | DEF: " .. tostring(data.Defense or 0)
     else
-        -- Full inventory update
+        -- Full inventory update - refresh the inventory display
+        currentInventoryData = data
         RefreshInventory(data)
+        
+        -- Also update gold from inventory data if available
+        if data.Gold then
+            GoldLabel.Text = "Gold: " .. tostring(data.Gold)
+        end
     end
 end
 

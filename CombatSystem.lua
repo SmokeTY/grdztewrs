@@ -150,8 +150,9 @@ local CombatConfig = {
     -- Enemy Settings
     EnemyAggroRange = 50,
     EnemyAttackRange = 5,
-    EnemyRespawnTime = 30,
-    BossRespawnTime = 300,
+    EnemyRespawnTime = 10,
+    BossRespawnTime = 60,
+    EnemyBodyFadeTime = 2,  -- Seconds before dead enemy body disappears
 }
 
 
@@ -1238,7 +1239,18 @@ function CombatController:HandleEnemyDeath(killerPlayer, enemyData)
     -- Send gold update
     LootRemote:FireClient(killerPlayer, "+" .. goldDrop .. " Gold", "Common")
     
-    -- Remove enemy from active list
+    -- ========================================================================
+    -- BODY DISAPPEAR & RESPAWN SYSTEM
+    -- Fade out the enemy model then destroy it, then respawn after timer
+    -- ========================================================================
+    
+    -- Save spawn info before removing from list
+    local enemyType = enemyData.EnemyType
+    local spawnPosition = enemyData.SpawnPosition
+    local isBoss = enemyData.IsBoss
+    local enemyModel = enemyData.Model
+    
+    -- Remove enemy from active list immediately (stops AI updates)
     for i, enemy in ipairs(self.ActiveEnemies) do
         if enemy == enemyData then
             table.remove(self.ActiveEnemies, i)
@@ -1246,10 +1258,44 @@ function CombatController:HandleEnemyDeath(killerPlayer, enemyData)
         end
     end
     
+    -- Fade out and destroy the body
+    if enemyModel then
+        task.spawn(function()
+            -- Make the body fade out over time
+            local fadeTime = CombatConfig.EnemyBodyFadeTime or 2
+            local steps = 10
+            local stepDelay = fadeTime / steps
+            
+            for step = 1, steps do
+                if not enemyModel or not enemyModel.Parent then break end
+                local transparency = step / steps
+                
+                -- Fade all parts in the model
+                for _, part in ipairs(enemyModel:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        part.Transparency = transparency
+                    elseif part:IsA("BillboardGui") then
+                        part.Enabled = (step < steps / 2)
+                    end
+                end
+                task.wait(stepDelay)
+            end
+            
+            -- Destroy the model completely
+            if enemyModel and enemyModel.Parent then
+                enemyModel:Destroy()
+            end
+        end)
+    end
+    
+    -- Clear model reference
+    enemyData.Model = nil
+    
     -- Schedule respawn
-    local respawnTime = enemyData.IsBoss and CombatConfig.BossRespawnTime or CombatConfig.EnemyRespawnTime
+    local respawnTime = isBoss and CombatConfig.BossRespawnTime or CombatConfig.EnemyRespawnTime
     task.delay(respawnTime, function()
-        self:SpawnEnemy(enemyData.EnemyType, enemyData.SpawnPosition)
+        self:SpawnEnemy(enemyType, spawnPosition)
+        print("[CombatSystem] Respawned: " .. tostring(enemyType) .. " at " .. tostring(spawnPosition))
     end)
 end
 
@@ -2248,9 +2294,16 @@ EquipRequestRemote.OnServerEvent:Connect(function(player, itemId)
     if ownsItem then
         local success, msg = playerData:EquipWeapon(itemId)
         if success then
-            LootRemote:FireClient(player, "Equipped: " .. (WeaponDatabase[itemId] and WeaponDatabase[itemId].Name or itemId), "Common")
+            LootRemote:FireClient(player, "Equipped: " .. (WeaponDatabase[itemId] and WeaponDatabase[itemId].Name or itemId), "Uncommon")
+            print("[CombatSystem] " .. player.Name .. " equipped: " .. itemId)
+        else
+            -- Tell the player why equip failed (e.g. level too low)
+            LootRemote:FireClient(player, msg or "Cannot equip!", "Common")
         end
+        -- Always send updated inventory back so UI refreshes
         CombatController:SendInventoryUpdate(player)
+    else
+        LootRemote:FireClient(player, "Item not in inventory!", "Common")
     end
 end)
 
@@ -2419,12 +2472,11 @@ RunService.Heartbeat:Connect(function()
                 end
             end
             
-            -- Remove dead enemies
-            if enemy.CurrentHealth <= 0 then
-                if enemy.Model then
-                    enemy.Model:Destroy()
-                    enemy.Model = nil
-                end
+            -- Dead enemies are already handled by HandleEnemyDeath (fade + destroy)
+            -- Just skip updating dead enemies that somehow remain in the list
+            if enemy.CurrentHealth <= 0 and enemy.Model then
+                enemy.Model:Destroy()
+                enemy.Model = nil
             end
         end
     end
