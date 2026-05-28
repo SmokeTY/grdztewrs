@@ -66,6 +66,22 @@ local LootRemote = Instance.new("RemoteEvent")
 LootRemote.Name = "LootEvent"
 LootRemote.Parent = Remotes
 
+local LootDropRemote = Instance.new("RemoteEvent")
+LootDropRemote.Name = "LootDropEvent"
+LootDropRemote.Parent = Remotes
+
+local InventoryUpdateRemote = Instance.new("RemoteEvent")
+InventoryUpdateRemote.Name = "InventoryUpdateEvent"
+InventoryUpdateRemote.Parent = Remotes
+
+local EquipRequestRemote = Instance.new("RemoteEvent")
+EquipRequestRemote.Name = "EquipRequestEvent"
+EquipRequestRemote.Parent = Remotes
+
+local OpenInventoryRemote = Instance.new("RemoteEvent")
+OpenInventoryRemote.Name = "OpenInventoryEvent"
+OpenInventoryRemote.Parent = Remotes
+
 local DamageRemote = Instance.new("RemoteEvent")
 DamageRemote.Name = "DamageEvent"
 DamageRemote.Parent = Remotes
@@ -1140,19 +1156,87 @@ function CombatController:HandleEnemyDeath(killerPlayer, enemyData)
     local goldDrop = math.random(goldMin, goldMax)
     data.Gold = data.Gold + goldDrop
     
-    -- Loot roll
-    if enemyData.LootTable and math.random() < (enemyData.LootChance or 0) then
-        local lootIndex = math.random(1, #enemyData.LootTable)
-        local lootItem = enemyData.LootTable[lootIndex]
-        local added = data:AddItem(lootItem)
+    -- ========================================================================
+    -- ENHANCED LOOT DROP SYSTEM
+    -- Drops physical loot on the ground that auto-collects when player is near
+    -- ========================================================================
+    
+    -- Determine loot drops (can drop multiple items)
+    local droppedItems = {}
+    
+    -- Main loot table roll
+    if enemyData.LootTable and #enemyData.LootTable > 0 then
+        local lootChance = enemyData.LootChance or 0.1
         
-        if added then
-            local weapon = WeaponDatabase[lootItem]
-            local itemName = weapon and weapon.Name or lootItem
-            LootRemote:FireClient(killerPlayer, itemName, weapon and weapon.Rarity or "Common")
-            print("[CombatSystem] " .. killerPlayer.Name .. " looted: " .. itemName)
+        -- Boss enemies always drop at least 1 item
+        if enemyData.IsBoss then
+            lootChance = math.max(lootChance, 0.8)
+        end
+        
+        -- Roll for each item in loot table
+        for _, itemId in ipairs(enemyData.LootTable) do
+            if math.random() < lootChance then
+                table.insert(droppedItems, itemId)
+            end
+        end
+        
+        -- Guarantee at least 1 drop from bosses
+        if enemyData.IsBoss and #droppedItems == 0 then
+            local randomIndex = math.random(1, #enemyData.LootTable)
+            table.insert(droppedItems, enemyData.LootTable[randomIndex])
         end
     end
+    
+    -- Bonus drop: random chance for any enemy to drop consumables
+    if math.random() < 0.3 then
+        -- Small health potion equivalent (gold bonus)
+        data.Gold = data.Gold + math.random(5, 20)
+    end
+    
+    -- Spawn physical loot drops in the world
+    local dropPosition = enemyData.Position or Vector3.new(0, 5, 0)
+    
+    for i, itemId in ipairs(droppedItems) do
+        local weapon = WeaponDatabase[itemId]
+        if weapon then
+            -- Create physical loot drop in the world
+            local lootDrop = self:SpawnLootDrop(itemId, weapon, dropPosition, i, killerPlayer)
+            
+            -- Notify player about the drop
+            LootRemote:FireClient(killerPlayer, weapon.Name, weapon.Rarity)
+            LootDropRemote:FireClient(killerPlayer, {
+                ItemId = itemId,
+                ItemName = weapon.Name,
+                Rarity = weapon.Rarity,
+                Position = dropPosition,
+            })
+            
+            print("[LootSystem] " .. killerPlayer.Name .. " got drop: " .. weapon.Name .. " (" .. weapon.Rarity .. ")")
+        end
+    end
+    
+    -- Auto-equip if the dropped weapon is better than current
+    for _, itemId in ipairs(droppedItems) do
+        local weapon = WeaponDatabase[itemId]
+        if weapon and data.Level >= weapon.LevelReq then
+            local added = data:AddItem(itemId)
+            if added then
+                -- Check if this weapon is better than currently equipped
+                local currentWeapon = data.EquippedWeapon and WeaponDatabase[data.EquippedWeapon]
+                if not currentWeapon or weapon.Damage > currentWeapon.Damage then
+                    data:EquipWeapon(itemId)
+                    print("[LootSystem] " .. killerPlayer.Name .. " auto-equipped: " .. weapon.Name)
+                    LootRemote:FireClient(killerPlayer, "Equipped: " .. weapon.Name, weapon.Rarity)
+                end
+                
+                -- Send inventory update to client
+                self:SendInventoryUpdate(killerPlayer)
+            end
+        end
+    end
+    
+    -- Send gold update
+    LootRemote:FireClient(killerPlayer, "+" .. goldDrop .. " Gold", "Common")
     
     -- Remove enemy from active list
     for i, enemy in ipairs(self.ActiveEnemies) do
@@ -1167,6 +1251,178 @@ function CombatController:HandleEnemyDeath(killerPlayer, enemyData)
     task.delay(respawnTime, function()
         self:SpawnEnemy(enemyData.EnemyType, enemyData.SpawnPosition)
     end)
+end
+
+--- Spawn a physical loot drop in the world (glowing pickup)
+function CombatController:SpawnLootDrop(itemId, weaponData, position, index, ownerPlayer)
+    -- Offset each drop slightly so they don't stack
+    local offset = Vector3.new(
+        math.random(-3, 3),
+        2,
+        math.random(-3, 3)
+    )
+    local dropPos = position + offset
+    
+    -- Rarity colors
+    local rarityColors = {
+        Common = Color3.fromRGB(200, 200, 200),
+        Uncommon = Color3.fromRGB(30, 255, 30),
+        Rare = Color3.fromRGB(30, 100, 255),
+        Epic = Color3.fromRGB(163, 53, 238),
+        Legendary = Color3.fromRGB(255, 165, 0),
+    }
+    
+    local color = rarityColors[weaponData.Rarity] or rarityColors.Common
+    
+    -- Create the physical loot part
+    local lootPart = Instance.new("Part")
+    lootPart.Name = "LootDrop_" .. itemId
+    lootPart.Size = Vector3.new(2, 2, 2)
+    lootPart.Position = dropPos
+    lootPart.Anchored = true
+    lootPart.CanCollide = false
+    lootPart.Shape = Enum.PartType.Ball
+    lootPart.Material = Enum.Material.Neon
+    lootPart.Color = color
+    lootPart.Transparency = 0.3
+    
+    -- Add glow effect
+    local light = Instance.new("PointLight")
+    light.Color = color
+    light.Brightness = 2
+    light.Range = 8
+    light.Parent = lootPart
+    
+    -- Add billboard label showing item name
+    local billboard = Instance.new("BillboardGui")
+    billboard.Size = UDim2.new(5, 0, 1.5, 0)
+    billboard.StudsOffset = Vector3.new(0, 2, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Parent = lootPart
+    
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, 0, 0.6, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = weaponData.Name
+    nameLabel.TextColor3 = color
+    nameLabel.TextStrokeTransparency = 0.5
+    nameLabel.TextScaled = true
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.Parent = billboard
+    
+    local rarityLabel = Instance.new("TextLabel")
+    rarityLabel.Size = UDim2.new(1, 0, 0.4, 0)
+    rarityLabel.Position = UDim2.new(0, 0, 0.6, 0)
+    rarityLabel.BackgroundTransparency = 1
+    rarityLabel.Text = "[" .. weaponData.Rarity .. "]"
+    rarityLabel.TextColor3 = color
+    rarityLabel.TextStrokeTransparency = 0.5
+    rarityLabel.TextScaled = true
+    rarityLabel.Font = Enum.Font.Gotham
+    rarityLabel.Parent = billboard
+    
+    lootPart.Parent = workspace
+    
+    -- Bobbing animation (float up and down)
+    task.spawn(function()
+        local startY = dropPos.Y
+        local elapsed = 0
+        while lootPart and lootPart.Parent do
+            elapsed = elapsed + 0.03
+            lootPart.Position = Vector3.new(dropPos.X, startY + math.sin(elapsed * 2) * 0.5, dropPos.Z)
+            lootPart.Orientation = Vector3.new(0, elapsed * 50, 0)
+            task.wait(0.03)
+        end
+    end)
+    
+    -- Auto-collect: any player that walks near it picks it up
+    task.spawn(function()
+        local lifetime = 60  -- Loot disappears after 60 seconds
+        local startTime = tick()
+        
+        while lootPart and lootPart.Parent and (tick() - startTime) < lifetime do
+            for _, player in ipairs(Players:GetPlayers()) do
+                local character = player.Character
+                if character then
+                    local hrp = character:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local dist = (hrp.Position - lootPart.Position).Magnitude
+                        if dist <= 8 then  -- Pickup radius
+                            -- Player is close enough to pick up
+                            local pData = self:GetPlayerData(player)
+                            if pData then
+                                local added = pData:AddItem(itemId)
+                                if added then
+                                    -- Check if better than current weapon
+                                    local currentWeapon = pData.EquippedWeapon and WeaponDatabase[pData.EquippedWeapon]
+                                    if not currentWeapon or weaponData.Damage > currentWeapon.Damage then
+                                        if pData.Level >= weaponData.LevelReq then
+                                            pData:EquipWeapon(itemId)
+                                            LootRemote:FireClient(player, "Auto-equipped: " .. weaponData.Name, weaponData.Rarity)
+                                        end
+                                    end
+                                    
+                                    LootRemote:FireClient(player, "Picked up: " .. weaponData.Name, weaponData.Rarity)
+                                    self:SendInventoryUpdate(player)
+                                    
+                                    -- Destroy the loot drop
+                                    lootPart:Destroy()
+                                    return
+                                else
+                                    LootRemote:FireClient(player, "Inventory full!", "Common")
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(0.2)
+        end
+        
+        -- Timeout - destroy uncollected loot
+        if lootPart and lootPart.Parent then
+            lootPart:Destroy()
+        end
+    end)
+    
+    return lootPart
+end
+
+--- Send inventory update to a player's client
+function CombatController:SendInventoryUpdate(player)
+    local data = self:GetPlayerData(player)
+    if not data then return end
+    
+    local inventoryInfo = {}
+    for _, item in ipairs(data.Inventory) do
+        local weapon = WeaponDatabase[item.Id]
+        if weapon then
+            table.insert(inventoryInfo, {
+                UUID = item.UUID,
+                Id = item.Id,
+                Name = weapon.Name,
+                Type = weapon.Type,
+                Subtype = weapon.Subtype,
+                Damage = weapon.Damage,
+                Speed = weapon.Speed,
+                Range = weapon.Range,
+                Rarity = weapon.Rarity,
+                LevelReq = weapon.LevelReq,
+                Description = weapon.Description,
+                CritBonus = weapon.CritBonus,
+                SpecialEffect = weapon.SpecialEffect,
+                IsEquipped = (data.EquippedWeapon == item.Id),
+            })
+        end
+    end
+    
+    InventoryUpdateRemote:FireClient(player, {
+        Items = inventoryInfo,
+        Gold = data.Gold,
+        EquippedWeapon = data.EquippedWeapon,
+        MaxSlots = 30,
+        UsedSlots = #data.Inventory,
+    })
 end
 
 
@@ -1975,6 +2231,34 @@ SkillRemote.OnServerEvent:Connect(function(player, skillName, targetPosition)
     CombatController:HandleSkillUse(player, skillName, targetPosition)
 end)
 
+-- Equip request from inventory UI
+EquipRequestRemote.OnServerEvent:Connect(function(player, itemId)
+    local playerData = CombatController:GetPlayerData(player)
+    if not playerData then return end
+    
+    -- Verify player owns the item
+    local ownsItem = false
+    for _, item in ipairs(playerData.Inventory) do
+        if item.Id == itemId then
+            ownsItem = true
+            break
+        end
+    end
+    
+    if ownsItem then
+        local success, msg = playerData:EquipWeapon(itemId)
+        if success then
+            LootRemote:FireClient(player, "Equipped: " .. (WeaponDatabase[itemId] and WeaponDatabase[itemId].Name or itemId), "Common")
+        end
+        CombatController:SendInventoryUpdate(player)
+    end
+end)
+
+-- Open inventory request - sends full inventory data to client
+OpenInventoryRemote.OnServerEvent:Connect(function(player)
+    CombatController:SendInventoryUpdate(player)
+end)
+
 -- Inventory remote function
 InventoryRemote.OnServerInvoke = function(player, action, data)
     local playerData = CombatController:GetPlayerData(player)
@@ -2069,6 +2353,8 @@ end
 
 local TICK_RATE = 1/30  -- 30 updates per second
 local lastTick = tick()
+local lastStatSync = 0
+local STAT_SYNC_INTERVAL = 1  -- Send stats to clients every 1 second
 
 RunService.Heartbeat:Connect(function()
     local now = tick()
@@ -2139,6 +2425,29 @@ RunService.Heartbeat:Connect(function()
                     enemy.Model:Destroy()
                     enemy.Model = nil
                 end
+            end
+        end
+    end
+    
+    -- Periodically sync stats (gold, XP, level) to all clients for HUD
+    if now - lastStatSync >= STAT_SYNC_INTERVAL then
+        lastStatSync = now
+        for player, data in pairs(CombatController.PlayerData) do
+            if player.Parent then
+                InventoryUpdateRemote:FireClient(player, {
+                    StatsUpdate = true,
+                    Gold = data.Gold,
+                    Level = data.Level,
+                    XP = data.XP,
+                    XPToNext = data.XPToNext,
+                    Health = {current = data.CurrentHealth, max = data.MaxHealth},
+                    Mana = {current = data.CurrentMana, max = data.MaxMana},
+                    Stamina = {current = data.CurrentStamina, max = data.MaxStamina},
+                    Attack = data.Attack,
+                    Defense = data.Defense,
+                    EquippedWeapon = data.EquippedWeapon,
+                    EquippedWeaponName = data.EquippedWeapon and WeaponDatabase[data.EquippedWeapon] and WeaponDatabase[data.EquippedWeapon].Name or "None",
+                })
             end
         end
     end
