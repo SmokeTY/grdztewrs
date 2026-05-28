@@ -1009,12 +1009,42 @@ function CombatController:InitPlayer(player)
     data:RecalculateStats()
     self.PlayerData[player] = data
     
-    -- Give starter weapon
+    -- Give starter weapon and equip it automatically so the player can attack mobs
+    data:AddItem("IronSword")
+    data:EquipWeapon("IronSword")
+    
+    -- Also give a backup weapon in inventory
     data:AddItem("WoodenSword")
-    data:EquipWeapon("WoodenSword")
     
     print("[CombatSystem] Initialized combat data for " .. player.Name)
+    print("[CombatSystem] Auto-equipped Iron Sword for " .. player.Name)
     return data
+end
+
+--- Auto-attack: automatically attack nearest mob when player clicks/taps
+-- This connects on character spawn to allow attacking without manual weapon equip
+function CombatController:SetupAutoAttack(player)
+    local data = self:GetPlayerData(player)
+    if not data then return end
+    
+    -- Ensure weapon is equipped; if somehow lost, re-equip
+    if not data.EquippedWeapon then
+        if #data.Inventory > 0 then
+            for _, item in ipairs(data.Inventory) do
+                local weapon = WeaponDatabase[item.Id]
+                if weapon and data.Level >= weapon.LevelReq then
+                    data:EquipWeapon(item.Id)
+                    print("[CombatSystem] Auto-re-equipped " .. weapon.Name .. " for " .. player.Name)
+                    break
+                end
+            end
+        else
+            -- Give a free weapon if they have none
+            data:AddItem("WoodenSword")
+            data:EquipWeapon("WoodenSword")
+            print("[CombatSystem] Gave free Wooden Sword to " .. player.Name)
+        end
+    end
 end
 
 --- Get a player's combat data
@@ -2132,6 +2162,76 @@ Players.PlayerAdded:Connect(function(player)
             humanoid.Health = data.CurrentHealth
             humanoid.WalkSpeed = data.Speed
         end
+        
+        -- Ensure player has a weapon equipped (auto-equip on every respawn)
+        CombatController:SetupAutoAttack(player)
+        
+        -- Auto-attack loop: automatically attack nearest enemy within range
+        -- This lets players fight mobs without needing to manually fire remotes
+        task.spawn(function()
+            while humanoid and humanoid.Health > 0 and player.Parent do
+                local hrp = character:FindFirstChild("HumanoidRootPart")
+                if hrp and data and data.EquippedWeapon and not data.IsStunned and not data.IsAttacking then
+                    local weapon = WeaponDatabase[data.EquippedWeapon]
+                    local attackRange = weapon and weapon.Range or 6
+                    
+                    -- Find nearest enemy in attack range
+                    local nearestEnemy = nil
+                    local nearestDist = math.huge
+                    for _, enemy in ipairs(CombatController.ActiveEnemies) do
+                        if enemy.CurrentHealth > 0 and enemy.Position then
+                            local dist = (enemy.Position - hrp.Position).Magnitude
+                            if dist <= attackRange and dist < nearestDist then
+                                nearestEnemy = enemy
+                                nearestDist = dist
+                            end
+                        end
+                    end
+                    
+                    -- Auto-attack the nearest enemy
+                    if nearestEnemy then
+                        local cooldown = CombatConfig.AttackCooldown
+                        if weapon then
+                            cooldown = cooldown / weapon.Speed
+                        end
+                        
+                        local now = tick()
+                        if now - data.LastAttackTime >= cooldown then
+                            -- Update combo
+                            if now - data.LastAttackTime > CombatConfig.ComboWindow then
+                                data.ComboCount = 0
+                            end
+                            data.ComboCount = math.min(data.ComboCount + 1, CombatConfig.MaxComboHits)
+                            data.LastAttackTime = now
+                            data.IsAttacking = true
+                            
+                            -- Calculate and apply damage
+                            local damage, isCrit = DamageEngine.CalculateDamage(data, nearestEnemy, false, nil)
+                            local finalDamage, wasCrit, result = DamageEngine.ApplyDamage(data, nearestEnemy, damage, isCrit)
+                            
+                            -- Fire damage VFX event
+                            DamageRemote:FireAllClients(
+                                nearestEnemy.Position or Vector3.new(0, 0, 0),
+                                finalDamage,
+                                wasCrit,
+                                result
+                            )
+                            
+                            -- Handle enemy death
+                            if result == "KILL" then
+                                CombatController:HandleEnemyDeath(player, nearestEnemy)
+                            end
+                            
+                            -- End attack state after short delay
+                            task.delay(0.3, function()
+                                data.IsAttacking = false
+                            end)
+                        end
+                    end
+                end
+                task.wait(0.1)  -- Check for enemies 10 times per second
+            end
+        end)
         
         -- Handle death
         humanoid.Died:Connect(function()
